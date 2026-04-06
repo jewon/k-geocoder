@@ -11,8 +11,11 @@ geocoder.py — 주소 텍스트 → GRS80 UTM-K 좌표 (건물중심점 X, Y)
     # CLI (단건)
     py geocoder.py "서울특별시 종로구 자하문로 94"
 
-    # CSV 배치
+    # CSV 배치 (쉼표 구분자)
     py geocoder.py input.csv --addr-col 주소 --output output.csv
+
+    # CSV 배치 (파이프 구분자)
+    py geocoder.py input.csv --addr-col 주소 --output output.csv --delimiter '|'
 """
 
 import os
@@ -96,7 +99,7 @@ def parse_address(text: str) -> dict:
     """
     text = normalize(text)
     tokens = text.split()
-    result = {"raw": text, "sido": None, "sigungu": None, "ri": None}
+    result = {"raw": text, "sido": None, "sigungu": None, "ri": None, "mountain_yn": "0"}
 
     idx = 0
 
@@ -129,8 +132,9 @@ def parse_address(text: str) -> dict:
     loc_sfx = ("동", "읍", "면", "리", "가")
     remaining = tokens[idx:]
 
-    # "강변역로50"처럼 도로명+번호 붙여쓰기 토큰을 분리
-    road_attached_pat = re.compile(r"^(.+(로|길|대로))(\d[\d\-]*)$")
+    # "강변역로50", "상일동526"처럼 지명+번호 붙여쓰기 토큰을 분리
+    road_attached_pat  = re.compile(r"^(.+(로|길|대로))(\d[\d\-]*)$")
+    jibun_attached_pat = re.compile(r"^(.+(동|읍|면|리|가))(산?\d[\d\-]*)")
     split_remaining = []
     for t in remaining:
         m = road_attached_pat.match(t)
@@ -138,7 +142,12 @@ def parse_address(text: str) -> dict:
             split_remaining.append(m.group(1))   # 도로명
             split_remaining.append(m.group(3))   # 번호
         else:
-            split_remaining.append(t)
+            m = jibun_attached_pat.match(t)
+            if m:
+                split_remaining.append(m.group(1))   # 지번동명
+                split_remaining.append(m.group(3))   # 번호
+            else:
+                split_remaining.append(t)
     remaining = split_remaining
 
     road_idx = None
@@ -153,9 +162,16 @@ def parse_address(text: str) -> dict:
         # road_idx 이전 토큰 중 위치 접미사 있으면 읍면동(참고용)
         if road_idx > 0:
             result["eupmyeondong"] = remaining[0]
-        result["road_name"] = remaining[road_idx]
+        road_name = remaining[road_idx]
+        after_start = road_idx + 1
+        # "정의로 8길"처럼 도로명 뒤에 "숫자+접미사" 토큰이 오면 합산 (예: "정의로8길")
+        branch_pat = re.compile(r"^\d+(로|길|대로)$")
+        if after_start < len(remaining) and branch_pat.match(remaining[after_start]):
+            road_name += remaining[after_start]
+            after_start += 1
+        result["road_name"] = road_name
         # 번호 파싱
-        after = remaining[road_idx + 1:]
+        after = remaining[after_start:]
         main_no, sub_no = _parse_number(after)
         result["main_no"] = main_no
         result["sub_no"] = sub_no
@@ -175,7 +191,17 @@ def parse_address(text: str) -> dict:
         else:
             after = remaining
 
-        main_no, sub_no = _parse_number(after)
+        # 산번지 감지: "산162-1" 또는 ["산", "162-1"] 형태 모두 처리
+        cleaned_after = []
+        for t in after:
+            if t == "산":
+                result["mountain_yn"] = "1"
+            elif t.startswith("산") and len(t) > 1 and t[1].isdigit():
+                result["mountain_yn"] = "1"
+                cleaned_after.append(t[1:])   # "산162-1" → "162-1"
+            else:
+                cleaned_after.append(t)
+        main_no, sub_no = _parse_number(cleaned_after)
         result["main_no"] = main_no
         result["sub_no"] = sub_no
 
@@ -183,24 +209,17 @@ def parse_address(text: str) -> dict:
 
 
 def _parse_number(tokens: list) -> tuple:
-    """['94'] → (94, 0)   ['94-3'] → (94, 3)   ['산', '10'] → (10, 0)"""
+    """['94'] → (94, 0)   ['94-3'] → (94, 3)   ['산', '10'] → (10, 0)
+    번호 뒤에 붙은 텍스트는 무시: ['182맵퍼스'] → (182, 0), ['182-3빌딩'] → (182, 3)
+    """
     main_no, sub_no = None, None
     for t in tokens:
         t = t.replace("번지", "").replace("번", "").strip()
-        if "-" in t:
-            parts = t.split("-", 1)
-            try:
-                main_no = int(parts[0])
-                sub_no = int(parts[1])
-            except ValueError:
-                pass
+        m = re.match(r'^(\d+)(?:-(\d+))?', t)
+        if m:
+            main_no = int(m.group(1))
+            sub_no = int(m.group(2)) if m.group(2) else 0
             break
-        try:
-            main_no = int(t)
-            sub_no = 0
-            break
-        except ValueError:
-            continue
     return main_no, sub_no
 
 
@@ -235,11 +254,13 @@ def query_road(cur, parsed: dict) -> tuple | None:
         return None
 
     base_clauses, base_params = _build_where(parsed)
+    # 지역 조건이 전혀 없으면 (sido/sigungu 모두 없음) 유일성 체크 필요
+    unique = not bool(base_clauses)
 
     # --- 시도 1차: exact match (시도 + 시군구 + 도로명 + 본번/부번) ---
     clauses = base_clauses + ["road_name = %s", "building_main_no = %s", "building_sub_no = %s"]
     params = base_params + [road_name, main_no, sub_no]
-    row = _fetch_build(cur, clauses, params)
+    row = _fetch_build(cur, clauses, params, unique=unique)
     if row:
         return row
 
@@ -247,7 +268,7 @@ def query_road(cur, parsed: dict) -> tuple | None:
     if sub_no != 0:
         clauses = base_clauses + ["road_name = %s", "building_main_no = %s", "building_sub_no = 0"]
         params = base_params + [road_name, main_no]
-        row = _fetch_build(cur, clauses, params)
+        row = _fetch_build(cur, clauses, params, unique=unique)
         if row:
             return row
 
@@ -276,7 +297,7 @@ def query_road(cur, parsed: dict) -> tuple | None:
     if road_stem != road_name:
         clauses = base_clauses + ["road_name LIKE %s", "building_main_no = %s"]
         params = base_params + [road_stem + "%", main_no]
-        row = _fetch_build(cur, clauses, params)
+        row = _fetch_build(cur, clauses, params, unique=unique)
         if row:
             return row
 
@@ -295,6 +316,8 @@ def query_jibun(cur, parsed: dict) -> tuple | None:
 
     base_clauses, base_params = _build_where(parsed)
 
+    mountain_yn = parsed.get("mountain_yn", "0")
+
     def _try(dong, ri_val, sub):
         clauses = base_clauses.copy()
         params = base_params.copy()
@@ -304,10 +327,8 @@ def query_jibun(cur, parsed: dict) -> tuple | None:
         if ri_val:
             clauses.append("j.ri = %s")
             params.append(ri_val)
-        clauses.append("j.jibun_main = %s")
-        params.append(main_no)
-        clauses.append("j.jibun_sub = %s")
-        params.append(sub)
+        clauses += ["j.mountain_yn = %s", "j.jibun_main = %s", "j.jibun_sub = %s"]
+        params += [mountain_yn, main_no, sub]
         return _fetch_jibun(cur, clauses, params)
 
     # 1차: eupmyeondong + ri + 본번/부번
@@ -341,8 +362,8 @@ def query_jibun(cur, parsed: dict) -> tuple | None:
         if ri:
             clauses.append("j.ri = %s")
             params.append(ri)
-        clauses += ["j.jibun_main = %s", "j.jibun_sub = %s"]
-        params += [main_no, sub_no]
+        clauses += ["j.mountain_yn = %s", "j.jibun_main = %s", "j.jibun_sub = %s"]
+        params += [mountain_yn, main_no, sub_no]
         row = _fetch_jibun(cur, clauses, params)
         if row:
             return row
@@ -350,17 +371,40 @@ def query_jibun(cur, parsed: dict) -> tuple | None:
     return None
 
 
-def _fetch_build(cur, clauses: list, params: list):
+def _fetch_build(cur, clauses: list, params: list, unique: bool = False):
     where = " AND ".join(clauses)
-    sql = f"""
-        SELECT building_center_x, building_center_y,
-               sido, sigungu, eupmyeondong, road_name,
-               building_main_no, building_sub_no, building_mgmt_no
-        FROM match_build
-        WHERE {where}
-        ORDER BY above_ground_floors DESC NULLS LAST
-        LIMIT 1
-    """
+    if unique:
+        # 지역 조건 없이 검색할 때: (sido, sigungu) 조합이 2개 이상이면 ambiguous → None 반환
+        sql = f"""
+            WITH hits AS (
+                SELECT building_center_x, building_center_y,
+                       sido, sigungu, eupmyeondong, road_name,
+                       building_main_no, building_sub_no, building_mgmt_no,
+                       above_ground_floors
+                FROM match_build
+                WHERE {where}
+            ),
+            addr_count AS (
+                SELECT COUNT(DISTINCT (sido, sigungu)) AS n FROM hits
+            )
+            SELECT h.building_center_x, h.building_center_y,
+                   h.sido, h.sigungu, h.eupmyeondong, h.road_name,
+                   h.building_main_no, h.building_sub_no, h.building_mgmt_no
+            FROM hits h, addr_count
+            WHERE addr_count.n = 1
+            ORDER BY h.above_ground_floors DESC NULLS LAST
+            LIMIT 1
+        """
+    else:
+        sql = f"""
+            SELECT building_center_x, building_center_y,
+                   sido, sigungu, eupmyeondong, road_name,
+                   building_main_no, building_sub_no, building_mgmt_no
+            FROM match_build
+            WHERE {where}
+            ORDER BY above_ground_floors DESC NULLS LAST
+            LIMIT 1
+        """
     cur.execute(sql, params)
     return cur.fetchone()
 
@@ -378,11 +422,12 @@ def _fetch_jibun(cur, clauses: list, params: list):
     sql = f"""
         SELECT b.building_center_x, b.building_center_y,
                b.sido, b.sigungu, b.eupmyeondong, b.road_name,
-               b.building_main_no, b.building_sub_no, b.building_mgmt_no
+               b.building_main_no, b.building_sub_no, b.building_mgmt_no,
+               j.jibun_seq
         FROM match_jibun j
         JOIN match_build b ON j.building_mgmt_no = b.building_mgmt_no
         WHERE {where}
-        ORDER BY b.above_ground_floors DESC NULLS LAST
+        ORDER BY j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
         LIMIT 1
     """
     cur.execute(sql, params)
@@ -427,12 +472,16 @@ class Geocoder:
                     if parsed2.get("main_no"):
                         row = query_jibun(cur, parsed2)
                         if row:
-                            method = "jibun_fallback"
+                            *row_data, jibun_seq = row
+                            row = tuple(row_data)
+                            method = "jibun" if jibun_seq == 0 else "jibun_related"
 
             elif addr_type == "jibun":
                 row = query_jibun(cur, parsed)
                 if row:
-                    method = "jibun"
+                    *row_data, jibun_seq = row
+                    row = tuple(row_data)
+                    method = "jibun" if jibun_seq == 0 else "jibun_related"
 
             else:
                 # 타입 판별 실패: 양쪽 시도
@@ -440,7 +489,10 @@ class Geocoder:
                 method = "road" if row else None
                 if not row:
                     row = query_jibun(cur, parsed)
-                    method = "jibun" if row else None
+                    if row:
+                        *row_data, jibun_seq = row
+                        row = tuple(row_data)
+                        method = "jibun" if jibun_seq == 0 else "jibun_related"
 
         if row:
             x, y, sido, sigungu, dong, road, main, sub, mgmt = row
@@ -458,7 +510,17 @@ class Geocoder:
         """건수에 따라 단건 반복 또는 bulk 모드를 자동 선택."""
         if len(addresses) >= _get_bulk_threshold():
             return self.geocode_batch_bulk(addresses)
-        return [self.geocode(addr) for addr in addresses]
+        total = len(addresses)
+        results = []
+        interval = max(1, total // 10)
+        for i, addr in enumerate(addresses):
+            results.append(self.geocode(addr))
+            done = i + 1
+            if done % interval == 0 or done == total:
+                print(f"  진행: {done:,}/{total:,}", end="\r", file=sys.stderr)
+        if total:
+            print(file=sys.stderr)
+        return results
 
     def geocode_batch_bulk(self, addresses: list) -> list:
         """
@@ -482,6 +544,7 @@ class Geocoder:
                 p.get("sido"), p.get("sigungu"),
                 p.get("road_name"), p.get("eupmyeondong"), p.get("ri"),
                 p.get("main_no"), p.get("sub_no") or 0,
+                p.get("mountain_yn", "0"),
             )
             for i, p in enumerate(parsed_list)
         ]
@@ -582,49 +645,57 @@ class Geocoder:
 
             # ── J1: 지번 exact (eupmyeondong + ri) ───────────────────────
             (f"""
-            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='jibun'
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y,
+                method = CASE WHEN sub.jibun_seq = 0 THEN 'jibun' ELSE 'jibun_related' END
             FROM (
                 SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
-                    b.building_center_x AS x, b.building_center_y AS y
+                    b.building_center_x AS x, b.building_center_y AS y,
+                    j.jibun_seq
                 FROM {B} ab2
                 JOIN {JIB} j ON j.sido=ab2.sido AND j.sigungu IS NOT DISTINCT FROM ab2.sigungu
                     AND j.eupmyeondong=ab2.eupmyeondong
                     AND j.ri IS NOT DISTINCT FROM ab2.ri
+                    AND j.mountain_yn=ab2.mountain_yn
                     AND j.jibun_main=ab2.main_no AND j.jibun_sub=ab2.sub_no
                 JOIN {BLD} b ON b.building_mgmt_no=j.building_mgmt_no
                 WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
                   AND ab2.addr_type='jibun' AND ab2.main_no IS NOT NULL
-                ORDER BY ab2.row_id, b.above_ground_floors DESC NULLS LAST
+                ORDER BY ab2.row_id, j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
             ) sub
             WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
             """),
 
             # ── J2: 지번, 부번 무시 ─────────────────────────────────────
             (f"""
-            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='jibun'
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y,
+                method = CASE WHEN sub.jibun_seq = 0 THEN 'jibun' ELSE 'jibun_related' END
             FROM (
                 SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
-                    b.building_center_x AS x, b.building_center_y AS y
+                    b.building_center_x AS x, b.building_center_y AS y,
+                    j.jibun_seq
                 FROM {B} ab2
                 JOIN {JIB} j ON j.sido=ab2.sido AND j.sigungu IS NOT DISTINCT FROM ab2.sigungu
                     AND j.eupmyeondong=ab2.eupmyeondong
                     AND j.ri IS NOT DISTINCT FROM ab2.ri
+                    AND j.mountain_yn=ab2.mountain_yn
                     AND j.jibun_main=ab2.main_no AND j.jibun_sub=0
                 JOIN {BLD} b ON b.building_mgmt_no=j.building_mgmt_no
                 WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
                   AND ab2.addr_type='jibun' AND ab2.main_no IS NOT NULL
                   AND ab2.sub_no != 0
-                ORDER BY ab2.row_id, b.above_ground_floors DESC NULLS LAST
+                ORDER BY ab2.row_id, j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
             ) sub
             WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
             """),
 
             # ── J3: 지번, ri 무시 ───────────────────────────────────────
             (f"""
-            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='jibun'
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y,
+                method = CASE WHEN sub.jibun_seq = 0 THEN 'jibun' ELSE 'jibun_related' END
             FROM (
                 SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
-                    b.building_center_x AS x, b.building_center_y AS y
+                    b.building_center_x AS x, b.building_center_y AS y,
+                    j.jibun_seq
                 FROM {B} ab2
                 JOIN {JIB} j ON j.sido=ab2.sido AND j.sigungu IS NOT DISTINCT FROM ab2.sigungu
                     AND j.eupmyeondong=ab2.eupmyeondong
@@ -633,25 +704,74 @@ class Geocoder:
                 WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
                   AND ab2.addr_type='jibun' AND ab2.main_no IS NOT NULL
                   AND ab2.ri IS NOT NULL
-                ORDER BY ab2.row_id, b.above_ground_floors DESC NULLS LAST
+                ORDER BY ab2.row_id, j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
             ) sub
             WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
             """),
 
             # ── J4: 지번, ri + 부번 무시 ────────────────────────────────
             (f"""
-            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='jibun'
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y,
+                method = CASE WHEN sub.jibun_seq = 0 THEN 'jibun' ELSE 'jibun_related' END
             FROM (
                 SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
-                    b.building_center_x AS x, b.building_center_y AS y
+                    b.building_center_x AS x, b.building_center_y AS y,
+                    j.jibun_seq
                 FROM {B} ab2
                 JOIN {JIB} j ON j.sido=ab2.sido AND j.sigungu IS NOT DISTINCT FROM ab2.sigungu
                     AND j.eupmyeondong=ab2.eupmyeondong
+                    AND j.mountain_yn=ab2.mountain_yn
                     AND j.jibun_main=ab2.main_no AND j.jibun_sub=0
                 JOIN {BLD} b ON b.building_mgmt_no=j.building_mgmt_no
                 WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
                   AND ab2.addr_type='jibun' AND ab2.main_no IS NOT NULL
                   AND ab2.ri IS NOT NULL AND ab2.sub_no != 0
+                ORDER BY ab2.row_id, j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
+            ) sub
+            WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
+            """),
+
+            # ── R6: 도로명 exact, 시도/시군구 없는 입력 (전국 유일 주소만 허용) ──
+            # (sido, sigungu) 조합이 2개 이상이면 ambiguous → 갱신 안 함
+            (f"""
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='road'
+            FROM (
+                SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
+                    b.building_center_x AS x, b.building_center_y AS y
+                FROM {B} ab2
+                JOIN {BLD} b ON b.road_name=ab2.road_name
+                    AND b.building_main_no=ab2.main_no AND b.building_sub_no=ab2.sub_no
+                WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
+                  AND ab2.addr_type='road' AND ab2.road_name IS NOT NULL
+                  AND ab2.sido IS NULL AND ab2.sigungu IS NULL
+                  AND 1 = (
+                      SELECT COUNT(DISTINCT (sido, sigungu))
+                      FROM {BLD}
+                      WHERE road_name=ab2.road_name AND building_main_no=ab2.main_no
+                  )
+                ORDER BY ab2.row_id, b.above_ground_floors DESC NULLS LAST
+            ) sub
+            WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
+            """),
+
+            # ── R7: 도로명, 부번 무시, 시도/시군구 없는 입력 ──────────────────
+            (f"""
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='road'
+            FROM (
+                SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
+                    b.building_center_x AS x, b.building_center_y AS y
+                FROM {B} ab2
+                JOIN {BLD} b ON b.road_name=ab2.road_name
+                    AND b.building_main_no=ab2.main_no AND b.building_sub_no=0
+                WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
+                  AND ab2.addr_type='road' AND ab2.road_name IS NOT NULL
+                  AND ab2.sido IS NULL AND ab2.sigungu IS NULL
+                  AND ab2.sub_no != 0
+                  AND 1 = (
+                      SELECT COUNT(DISTINCT (sido, sigungu))
+                      FROM {BLD}
+                      WHERE road_name=ab2.road_name AND building_main_no=ab2.main_no
+                  )
                 ORDER BY ab2.row_id, b.above_ground_floors DESC NULLS LAST
             ) sub
             WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
@@ -659,19 +779,22 @@ class Geocoder:
 
             # ── RF: road-as-jibun fallback (세종로 211 등 법정동명이 로/길로 끝나는 경우) ──
             (f"""
-            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y, method='jibun_fallback'
+            UPDATE {B} ab SET result_x=sub.x, result_y=sub.y,
+                method = CASE WHEN sub.jibun_seq = 0 THEN 'jibun' ELSE 'jibun_related' END
             FROM (
                 SELECT DISTINCT ON (ab2.row_id) ab2.row_id,
-                    b.building_center_x AS x, b.building_center_y AS y
+                    b.building_center_x AS x, b.building_center_y AS y,
+                    j.jibun_seq
                 FROM {B} ab2
                 JOIN {JIB} j ON j.sido=ab2.sido AND j.sigungu IS NOT DISTINCT FROM ab2.sigungu
                     AND j.eupmyeondong=ab2.road_name
+                    AND j.mountain_yn='0'
                     AND j.jibun_main=ab2.main_no AND j.jibun_sub=ab2.sub_no
                 JOIN {BLD} b ON b.building_mgmt_no=j.building_mgmt_no
                 WHERE ab2.batch_id=%(bid)s AND ab2.result_x IS NULL
                   AND ab2.addr_type='road' AND ab2.road_name IS NOT NULL
                   AND ab2.main_no IS NOT NULL
-                ORDER BY ab2.row_id, b.above_ground_floors DESC NULLS LAST
+                ORDER BY ab2.row_id, j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
             ) sub
             WHERE ab.batch_id=%(bid)s AND ab.row_id=sub.row_id AND ab.result_x IS NULL
             """),
@@ -682,13 +805,20 @@ class Geocoder:
                 # INSERT — psycopg3 COPY 방식 (bulk insert 최적화)
                 with cur.copy(
                     f"COPY {B} (batch_id, row_id, addr_type, sido, sigungu,"
-                    f" road_name, eupmyeondong, ri, main_no, sub_no) FROM STDIN"
+                    f" road_name, eupmyeondong, ri, main_no, sub_no, mountain_yn) FROM STDIN"
                 ) as copy:
                     for row in rows:
                         copy.write_row(row)
+                print(f"  {len(rows):,}건 적재 완료, fallback 매칭 시작...", file=sys.stderr)
                 # fallback UPDATE 단계 실행
-                for sql in update_steps:
+                total_steps = len(update_steps)
+                cumulative = 0
+                for step_idx, sql in enumerate(update_steps, 1):
                     cur.execute(sql, {"bid": bid})
+                    n = cur.rowcount
+                    cumulative += n
+                    if n > 0:
+                        print(f"  단계 {step_idx:2d}/{total_steps}: +{n:,}건  (누적 {cumulative:,}건)", file=sys.stderr)
                 # 결과 수집
                 cur.execute(
                     f"SELECT row_id, result_x, result_y, method FROM {B}"
@@ -728,14 +858,15 @@ def main():
     parser.add_argument("input", help="주소 문자열 또는 CSV 파일 경로")
     parser.add_argument("--addr-col", default="주소", help="CSV에서 주소 컬럼명 (기본: 주소)")
     parser.add_argument("--output", help="결과 CSV 저장 경로 (생략 시 stdout)")
+    parser.add_argument("--delimiter", default=",", help="CSV 구분자 (기본: ',', 파이프의 경우 '|')")
     args = parser.parse_args()
 
     gc = Geocoder()
 
     # CSV 배치 모드
-    if args.input.endswith(".csv"):
+    if args.input.endswith((".csv", ".txt")):
         with open(args.input, encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
+            reader = csv.DictReader(f, delimiter=args.delimiter)
             rows = list(reader)
 
         addrs = [row.get(args.addr_col, "") for row in rows]
@@ -746,15 +877,35 @@ def main():
             for row, r in zip(rows, geocoded)
         ]
 
+        # 결과 요약
+        total_n = len(geocoded)
+        success_n = sum(1 for r in geocoded if r["x"] is not None)
+        fail_n = total_n - success_n
+        methods: dict = {}
+        for r in geocoded:
+            m = r.get("method")
+            if m:
+                methods[m] = methods.get(m, 0) + 1
+        print("─" * 38, file=sys.stderr)
+        print(f"지오코딩 완료", file=sys.stderr)
+        print(f"  전체  {total_n:>8,} 건", file=sys.stderr)
+        if total_n:
+            print(f"  성공  {success_n:>8,} 건  ({success_n / total_n * 100:.1f}%)", file=sys.stderr)
+            print(f"  실패  {fail_n:>8,} 건  ({fail_n / total_n * 100:.1f}%)", file=sys.stderr)
+        if methods:
+            method_str = "  /  ".join(f"{k} {v:,}" for k, v in sorted(methods.items()))
+            print(f"  방법  {method_str}", file=sys.stderr)
+        print("─" * 38, file=sys.stderr)
+
         fieldnames = list(rows[0].keys()) + ["x", "y", "matched", "method"]
         if args.output:
             with open(args.output, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=args.delimiter)
                 writer.writeheader()
                 writer.writerows(results)
             print(f"저장 완료: {args.output} ({len(results)}건)")
         else:
-            writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+            writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, delimiter=args.delimiter)
             writer.writeheader()
             writer.writerows(results)
 

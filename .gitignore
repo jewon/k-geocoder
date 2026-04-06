@@ -2,4 +2,5 @@
 .claude
 data/
 __pycache__/
+.temp/
 *.pyc

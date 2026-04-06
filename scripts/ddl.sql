@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS addr_batch (
     ri              TEXT,
     main_no         INTEGER,
     sub_no          INTEGER      DEFAULT 0,
+    mountain_yn     VARCHAR(1)   DEFAULT '0',
     result_x        NUMERIC(15,6),
     result_y        NUMERIC(15,6),
     method          TEXT,

@@ -188,7 +188,7 @@ gc.close()
 | `x` | 건물중심점 X 좌표 (GRS80 UTM-K), 실패 시 `None` |
 | `y` | 건물중심점 Y 좌표 (GRS80 UTM-K), 실패 시 `None` |
 | `matched` | 매칭된 주소 문자열 |
-| `method` | 매칭 방법 (`road` / `jibun` / `jibun_fallback`) |
+| `method` | 매칭 방법 (`road` / `jibun` / `jibun_related`) |
 | `building_mgmt_no` | 건물관리번호 |
 | `error` | 실패 시 오류 메시지 |
 
