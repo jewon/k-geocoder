@@ -23,6 +23,7 @@ import re
 import sys
 import csv
 import uuid
+import json
 import argparse
 import psycopg
 from dotenv import load_dotenv
@@ -371,6 +372,35 @@ def query_jibun(cur, parsed: dict) -> tuple | None:
     return None
 
 
+_PRIORITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bldg_priority.json")
+
+
+def _load_priority_sql(path: str = _PRIORITY_FILE) -> str:
+    """bldg_priority.json을 읽어 ORDER BY용 SQL 식을 생성."""
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    scores  = cfg.get("bldg_use_class_score", {})
+    default = cfg.get("default_score", 3)
+    adj     = cfg.get("apt_yn_adjustment", {})
+
+    # bldg_use_class 별 기본 점수
+    whens = " ".join(f"WHEN '{k}' THEN {v}" for k, v in scores.items())
+    use_sql = f"CASE bldg_use_class {whens} ELSE {default} END"
+
+    # apt_yn 조정값 (0이 아닌 항목만)
+    adj_whens = " ".join(f"WHEN '{k}' THEN {v}" for k, v in adj.items() if v != 0)
+    apt_sql = f" + CASE apt_yn {adj_whens} ELSE 0 END" if adj_whens else ""
+
+    return f"\n    {use_sql}{apt_sql}\n"
+
+
+try:
+    _BLDG_PRIORITY_SQL = _load_priority_sql()
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    _BLDG_PRIORITY_SQL = "\n    above_ground_floors\n"
+
+
 def _fetch_build(cur, clauses: list, params: list, unique: bool = False):
     where = " AND ".join(clauses)
     if unique:
@@ -380,7 +410,7 @@ def _fetch_build(cur, clauses: list, params: list, unique: bool = False):
                 SELECT building_center_x, building_center_y,
                        sido, sigungu, eupmyeondong, road_name,
                        building_main_no, building_sub_no, building_mgmt_no,
-                       above_ground_floors
+                       bldg_use_class, apt_yn, above_ground_floors
                 FROM match_build
                 WHERE {where}
             ),
@@ -392,7 +422,7 @@ def _fetch_build(cur, clauses: list, params: list, unique: bool = False):
                    h.building_main_no, h.building_sub_no, h.building_mgmt_no
             FROM hits h, addr_count
             WHERE addr_count.n = 1
-            ORDER BY h.above_ground_floors DESC NULLS LAST
+            ORDER BY {_BLDG_PRIORITY_SQL} DESC, h.above_ground_floors DESC NULLS LAST
             LIMIT 1
         """
     else:
@@ -402,7 +432,7 @@ def _fetch_build(cur, clauses: list, params: list, unique: bool = False):
                    building_main_no, building_sub_no, building_mgmt_no
             FROM match_build
             WHERE {where}
-            ORDER BY above_ground_floors DESC NULLS LAST
+            ORDER BY {_BLDG_PRIORITY_SQL} DESC, above_ground_floors DESC NULLS LAST
             LIMIT 1
         """
     cur.execute(sql, params)
@@ -427,7 +457,7 @@ def _fetch_jibun(cur, clauses: list, params: list):
         FROM match_jibun j
         JOIN match_build b ON j.building_mgmt_no = b.building_mgmt_no
         WHERE {where}
-        ORDER BY j.jibun_seq ASC, b.above_ground_floors DESC NULLS LAST
+        ORDER BY j.jibun_seq ASC, {_BLDG_PRIORITY_SQL} DESC, b.above_ground_floors DESC NULLS LAST
         LIMIT 1
     """
     cur.execute(sql, params)

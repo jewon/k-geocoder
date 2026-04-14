@@ -6,13 +6,14 @@
 
 ```
 geocode/
-├── .env                # DB 접속 정보 (직접 생성, git 제외)
-├── .env.example        # 설정 템플릿
-├── geocoder.py         # 지오코딩 툴 (단건 / CSV 배치)
-├── load_data.py        # 데이터 적재 스크립트
+├── .env                  # DB 접속 정보 (직접 생성, git 제외)
+├── .env.example          # 설정 템플릿
+├── geocoder.py           # 지오코딩 툴 (단건 / CSV 배치)
+├── bldg_priority.json    # 건물 선택 우선순위 설정 (선택)
+├── load_data.py          # 데이터 적재 스크립트
 ├── scripts/
-│   └── ddl.sql         # 테이블 생성 DDL (DB 관리자 실행)
-└── data/               # 원본 txt 파일 (git 제외)
+│   └── ddl.sql           # 테이블 생성 DDL (DB 관리자 실행)
+└── data/                 # 원본 txt 파일 (git 제외)
     ├── match_build_*.txt
     ├── match_jibun_*.txt
     └── match_rs_entrc.txt
@@ -117,6 +118,42 @@ DB 접속 중... (192.168.0.1 / mydb / schema: geocoding)
 ```bash
 py load_data.py --truncate
 ```
+
+---
+
+## 건물 선택 우선순위 설정
+
+같은 주소에 건물이 여러 개 등록된 경우, `bldg_priority.json`의 점수 기준으로 대표 건물을 선택합니다.
+파일이 없거나 손상된 경우 기본값으로 층수가 가장 높은 건물을 선택합니다.
+
+### bldg_priority.json 구조
+
+```json
+{
+  "bldg_use_class_score": {
+    "근린생활시설": 9,
+    "유통시설": 8,
+    "업무시설": 7,
+    "숙박시설": 6,
+    "의료시설": 6,
+    "교육및복지시설": 6,
+    "..."  : "..."
+  },
+  "default_score": 3,
+  "apt_yn_adjustment": {
+    "1": -3,
+    "2": -2
+  }
+}
+```
+
+| 항목 | 설명 |
+|---|---|
+| `bldg_use_class_score` | DB의 `bldg_use_class` 값별 기본 점수 (높을수록 우선) |
+| `default_score` | 목록에 없는 용도 분류에 적용할 기본 점수 |
+| `apt_yn_adjustment` | 공동주택 여부에 따른 조정값 (음수 = 패널티)<br>`1`: 아파트, `2`: 연립/다세대, `0`: 그 외 (조정 없음) |
+
+점수가 동점이면 층수(`above_ground_floors`) 높은 건물을 선택합니다.
 
 ---
 
