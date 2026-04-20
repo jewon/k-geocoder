@@ -382,23 +382,37 @@ def _load_priority_sql(path: str = _PRIORITY_FILE) -> str:
 
     scores  = cfg.get("bldg_use_class_score", {})
     default = cfg.get("default_score", 3)
-    adj     = cfg.get("apt_yn_adjustment", {})
 
     # bldg_use_class 별 기본 점수
     whens = " ".join(f"WHEN '{k}' THEN {v}" for k, v in scores.items())
     use_sql = f"CASE bldg_use_class {whens} ELSE {default} END"
 
-    # apt_yn 조정값 (0이 아닌 항목만)
-    adj_whens = " ".join(f"WHEN '{k}' THEN {v}" for k, v in adj.items() if v != 0)
-    apt_sql = f" + CASE apt_yn {adj_whens} ELSE 0 END" if adj_whens else ""
+    # apt_yn_adjustment: [{values: [...], score: N}, ...]
+    apt_whens = " ".join(
+        f"WHEN '{v}' THEN {rule['score']}"
+        for rule in cfg.get("apt_yn_adjustment", [])
+        for v in rule.get("values", [])
+        if rule.get("score", 0) != 0
+    )
+    apt_sql = f" + CASE apt_yn {apt_whens} ELSE 0 END" if apt_whens else ""
 
-    return f"\n    {use_sql}{apt_sql}\n"
+    # detail_bldg_name_bonus: [{keywords: [...], score: N}, ...]
+    nm_parts = []
+    for rule in cfg.get("detail_bldg_name_bonus", []):
+        keywords = rule.get("keywords", [])
+        score = rule.get("score", 0)
+        if keywords and score:
+            cond = " OR ".join(f"detail_bldg_name LIKE '%{kw}%'" for kw in keywords)
+            nm_parts.append(f"CASE WHEN {cond} THEN {score} ELSE 0 END")
+    nm_sql = " + " + " + ".join(nm_parts) if nm_parts else ""
+
+    return f"({use_sql}{apt_sql}{nm_sql})"
 
 
 try:
     _BLDG_PRIORITY_SQL = _load_priority_sql()
 except (FileNotFoundError, json.JSONDecodeError, OSError):
-    _BLDG_PRIORITY_SQL = "\n    above_ground_floors\n"
+    _BLDG_PRIORITY_SQL = "above_ground_floors"
 
 
 def _fetch_build(cur, clauses: list, params: list, unique: bool = False):
